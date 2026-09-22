@@ -4,8 +4,8 @@ from pathlib import Path
 
 from core.mxf_parser import parse as mxf_parse
 from core.autodetect import autodetect
-from core.decoder import (decode_frame, split_channels,
-                          PATTERNS, detect_frame_size)
+from core.decoder import (decode_frame, split_channels, PATTERNS,
+                          detect_resolution)
 from core.stats import print_detection, print_channels_short, print_channels_full
 from core.exporter import save_frame
 
@@ -23,24 +23,31 @@ def find_raw_files(directory: Path) -> list[Path]:
 def _resolve_resolution(filepath: Path, W: int, H: int,
                         result: dict) -> tuple[int, int, str]:
     """
-    Возвращает (W, H, имя источника).
+    Возвращает (W, H, source_name).
+
     Если W или H == AUTO (0), пытается определить по essence_size.
+    Header определяется отдельно в autodetect (по viable_headers).
     """
-    if W > 0 and H > 0:
-        return W, H, "вручную/настройками"
-
     essence_size = result["frame_size"]
-    header = 76
 
-    det = detect_frame_size(essence_size, header)
-    if det:
-        w, h, name = det
-        return w, h, f"авто ({name})"
+    if W > 0 and H > 0:
+        return W, H, "вручную"
 
-    raise RuntimeError(
-        f"Не могу определить разрешение для essence_size={essence_size:,}. "
-        f"Задайте вручную."
-    )
+    cands = detect_resolution(essence_size)
+    if not cands:
+        raise RuntimeError(
+            f"Не могу определить разрешение для essence_size="
+            f"{essence_size:,}. Задайте вручную (пункт [p])."
+        )
+
+    if len(cands) > 1:
+        print(f"   ⚠ Найдено несколько разрешений:")
+        for i, (w, h, hdr, name) in enumerate(cands, 1):
+            print(f"      [{i}] {w}×{h}  header={hdr}  {name}")
+        print(f"   ℹ Использую первое.")
+
+    W_, H_, header, name = cands[0]
+    return W_, H_, f"авто ({name}, header={header})"
 
 
 def process_file(filepath: Path, W: int, H: int,
@@ -68,7 +75,7 @@ def process_file(filepath: Path, W: int, H: int,
     except Exception as e:
         print(f"   ❌ {e}")
         return
-    if (W_use, H_use) != (W, H):
+    if (W_use, H_use) != (W, H) or W == AUTO or H == AUTO:
         print(f"   📐 Разрешение:  {W_use} × {H_use}  ({src})")
 
     # --- Параметры распаковки
@@ -171,7 +178,7 @@ def _prompt_frames(total: int, current_mode: str,
 
 def main_menu() -> None:
     cwd = Path.cwd()
-    W, H = AUTO, AUTO  # авто по умолчанию
+    W, H = AUTO, AUTO
     manual_params: dict | None = None
     verbose = False
     frame_mode = "all"
@@ -186,7 +193,7 @@ def main_menu() -> None:
 
         print()
         print("═" * 72)
-        print(f"  ARRIRAW → TIFF  (ALEXA Mini)")
+        print(f"  ARRIRAW → TIFF  (ALEXA Mini / LF)")
         print(f"  Папка:          {cwd}")
         print(f"  Разрешение:     {res_label}")
         print(f"  Режим расп.:    "
@@ -223,7 +230,7 @@ def main_menu() -> None:
         elif choice == "r":
             continue
         elif choice == "f":
-            total = 17
+            total = 1
             if files:
                 try:
                     r = mxf_parse(files[0])

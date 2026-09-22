@@ -63,12 +63,21 @@ def _score_channels(chans: dict) -> dict | None:
     }
 
 
-def _viable_headers(essence_size: int, W: int, H: int) -> list[int]:
+def _viable_headers(essence_size: int, W: int, H: int,
+                    max_header: int = 512) -> list[int]:
+    """
+    Все header'ы в [0, max_header), при которых
+
+        (essence_size - header) == 2 * ((W*H/2) * 3/2)
+
+    Для 3424×2202 / essence 11 309 548 → [76]
+    Для 3424×2202 / essence 11 309 472 → [0]
+    Для 4448×3096 / essence 20 656 552 → [40]
+    """
     chunk_pixels = (W * H) // 2
     chunk_bytes = chunk_pixels * 3 // 2
     needed = 2 * chunk_bytes
-    candidates = [76, 0, 4, 8, 16, 32, 64, 128, 152, 256, 4096]
-    return [h for h in candidates if essence_size - h == needed]
+    return [h for h in range(0, max_header) if essence_size - h == needed]
 
 
 def _evaluate_one(raw, essence_size, hdr, unpack_mode, assembly,
@@ -124,10 +133,12 @@ def autodetect(filepath, pkt, W: int, H: int,
     print(f"\n   🔧 Доступные unpack: {list(UNPACK_FUNCS)}")
 
     viable = _viable_headers(essence_size, W, H)
-    print(f"   🔍 Жизнеспособные header: {viable}")
+    print(f"   🔍 Жизнеспособные header для {W}×{H}: {viable}")
     if not viable:
-        print(f"   ⚠ Не найдено точного header. Использую [76].")
-        viable = [76]
+        print(f"   ⚠ Ни один header в [0, 512) не подходит для {W}×{H}.")
+        print(f"   ⚠ essence_size={essence_size:,}")
+        print(f"   ⚠ Задайте разрешение вручную ([p] в меню).")
+        return None
 
     with open(filepath, "rb") as f:
         f.seek(pkt["value_start"])
@@ -199,7 +210,17 @@ def autodetect(filepath, pkt, W: int, H: int,
               f"{c['sp_avg']:>+7.3f}  {c['min_std']:>8.0f}  "
               f"{c['max_std']:>8.0f}{marker}")
 
-    best = candidates[0]
-    if best["corr_g1g2"] < 0.5 and known_good:
-        return known_good[0]
+        best = candidates[0]
+    if best["corr_g1g2"] < 0.5:
+        print(f"\n   ⚠ Даже лучший кандидат corr(G1,G2) = "
+              f"{best['corr_g1g2']:+.3f} < 0.5")
+        print(f"   ⚠ Параметры распаковки подобраны неуверенно.")
+        print(f"   ⚠ Возможные причины:")
+        print(f"      - файл в формате HDE (сжат) — нужен ARRI SDK")
+        print(f"      - пустой / тестовый кадр")
+        print(f"      - разрешение определено неверно (попробуйте [p])")
+        if known_good:
+            print(f"   ℹ Возвращаю known-good (может быть пустой кадр).")
+            return known_good[0]
+        print(f"   ℹ Возвращаю лучший найденный (возможен мусор).")
     return best

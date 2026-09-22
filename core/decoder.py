@@ -166,37 +166,61 @@ def decode_frame(raw: bytes, header: int, unpack_mode: str,
 
 
 # ===========================================================================
-# Автоопределение разрешения по размеру essence
+# Автоопределение разрешения и header по размеру essence
 # ===========================================================================
 
-# Известные разрешения ARRI (W, H, name)
 KNOWN_RESOLUTIONS = [
+    # ALEXA Mini
     (3424, 2202, "ALEXA Mini 3.4K Open Gate"),
+    (3200, 1800, "ALEXA Mini 3.2K 16:9"),
+    (3168, 1776, "ALEXA Mini 3.2K"),
     (2880, 2160, "ALEXA Mini 4:3 2.8K"),
     (2880, 1620, "ALEXA Mini 16:9 2.8K"),
-    (3200, 1800, "ALEXA Mini 3.2K 16:9"),
-    (4448, 3096, "ALEXA 65 4.5K"),
+    # ALEXA LF / 65
+    (4448, 3096, "ALEXA LF 4.5K Open Gate"),
     (4096, 2304, "ALEXA LF 4K 16:9"),
+    (4608, 3164, "ALEXA 65 4.6K"),
+    (6560, 3100, "ALEXA 65 6.5K"),
+    # Универсальные
+    (4096, 2160, "DCI 4K"),
     (3840, 2160, "UHD 4K"),
     (1920, 1080, "HD 1080p"),
 ]
 
 
-def detect_frame_size(essence_size: int,
-                      header: int = 76) -> tuple[int, int, str] | None:
+def detect_resolution(essence_size: int,
+                      max_header: int = 512) -> list[tuple[int, int, int, str]]:
     """
-    Определяет (W, H, имя) по размеру essence.
+    Возвращает список (W, H, header, name), для которых
 
-    Модель: essence_size = header + 2 * chunk_bytes,
-           chunk_bytes   = (W*H/2) * 3/2,
-           значит W*H = essence_size_avail * 2 / 3.
+        essence_size == header + 2 * (W*H/2) * 3/2
+
+    Отсортирован по header (меньший — раньше).
     """
-    avail = essence_size - header
-    if avail <= 0 or avail % 3 != 0:
-        return None
-    total_pixels = (avail * 2) // 3
-
+    out = []
     for w, h, name in KNOWN_RESOLUTIONS:
-        if w * h == total_pixels:
-            return (w, h, name)
-    return None
+        chunk_pixels = (w * h) // 2
+        chunk_bytes = chunk_pixels * 3 // 2
+        needed = 2 * chunk_bytes
+        header = essence_size - needed
+        if 0 <= header < max_header:
+            out.append((w, h, header, name))
+    out.sort(key=lambda c: c[2])
+    return out
+
+
+def detect_frame_size(essence_size: int,
+                      header: int | None = None) -> tuple[int, int, str] | None:
+    """
+    Backward-compat: (W, H, name) или None.
+
+    Если header задан — используется как ограничение (ищет только
+    с этим header). Если None — перебирает все [0, 512).
+    """
+    cands = detect_resolution(essence_size, max_header=512)
+    if header is not None:
+        cands = [c for c in cands if c[2] == header]
+    if not cands:
+        return None
+    w, h, _, name = cands[0]
+    return (w, h, name)
