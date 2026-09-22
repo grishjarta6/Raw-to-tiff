@@ -1,0 +1,20 @@
+[project]
+name = "raw-to-tiff"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "user", email = "user@DESKTOP-4N2N0M0" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.5.3",
+    "tifffile>=2026.9.20",
+]
+
+[project.scripts]
+raw-to-tiff = "raw_to_tiff:main"
+
+[build-system]
+requires = ["uv_build>=0.12.13,<0.13.0"]
+build-backend = "uv_build"
