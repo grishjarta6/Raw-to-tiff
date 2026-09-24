@@ -4,13 +4,13 @@ from pathlib import Path
 
 from core.mxf_parser import parse as mxf_parse
 from core.autodetect import autodetect
-from core.decoder import (decode_frame, split_channels, PATTERNS,
+from core.decoder import (make_decoder, split_channels,
                           detect_resolution)
-from core.stats import print_detection, print_channels_short, print_channels_full
+from core.stats import print_detection, print_channels_short
 from core.exporter import save_frame
 
 
-AUTO = 0  # маркер «определить автоматически»
+AUTO = 0
 
 
 def find_raw_files(directory: Path) -> list[Path]:
@@ -22,12 +22,6 @@ def find_raw_files(directory: Path) -> list[Path]:
 
 def _resolve_resolution(filepath: Path, W: int, H: int,
                         result: dict) -> tuple[int, int, str]:
-    """
-    Возвращает (W, H, source_name).
-
-    Если W или H == AUTO (0), пытается определить по essence_size.
-    Header определяется отдельно в autodetect (по viable_headers).
-    """
     essence_size = result["frame_size"]
 
     if W > 0 and H > 0:
@@ -50,26 +44,42 @@ def _resolve_resolution(filepath: Path, W: int, H: int,
     return W_, H_, f"авто ({name}, header={header})"
 
 
-def process_file(filepath: Path, W: int, H: int,
-                 force_params: dict | None = None,
-                 verbose: bool = False,
-                 frame_mode: str = "all",
-                 frame_index: int = 0) -> None:
+def process_file(filepath, W, H, force_params=None, verbose=False,
+                 frame_mode="all", frame_index=0, engine="auto") -> None:
     print(f"\n{'═' * 72}")
     print(f"📂 {filepath.name}")
     print(f"{'═' * 72}")
 
+    # --- Fallback принудительно
+    if engine == "fallback":
+        print(f"\n   🔁 Движок: fallback (принудительно)")
+        from core.fallback_engine import try_process
+        out_dir = filepath.parent / f"{filepath.stem}_channels"
+        ok = try_process(filepath, out_dir=out_dir, save_rgb=True)
+        if not ok:
+            print(f"   ❌ Fallback не сработал.")
+        return
+
+    # --- MXF
     try:
         result = mxf_parse(filepath)
     except Exception as e:
         print(f"   ❌ Ошибка парсинга MXF: {e}")
+        if engine == "auto":
+            print(f"\n   🔁 Пробую fallback-движок...")
+            from core.fallback_engine import try_process
+            out_dir = filepath.parent / f"{filepath.stem}_channels"
+            ok = try_process(filepath, out_dir=out_dir, save_rgb=True)
+            if not ok:
+                print(f"   ❌ Fallback тоже не сработал.")
+        else:
+            print(f"   ℹ Движок=mxf, fallback отключён.")
         return
 
     packets = result["essence"]
     print(f"   Кадров:         {len(packets)}")
     print(f"   Размер пакета:  {packets[0]['length']:,} байт")
 
-    # --- Автоопределение разрешения
     try:
         W_use, H_use, src = _resolve_resolution(filepath, W, H, result)
     except Exception as e:
@@ -87,10 +97,31 @@ def process_file(filepath: Path, W: int, H: int,
     else:
         print(f"\n   🔍 Автоопределение параметров...")
         det = autodetect(filepath, packets[0], W_use, H_use, verbose=verbose)
+
+        # Если det плох и разрешён auto — переключаемся на fallback
+        det_bad = (det is None) or (det.get("corr_g1g2", 0) < 0.5)
+        if det_bad and engine == "auto":
+            print(f"\n   ⚠ MXF-движок не дал уверенного результата "
+                  f"(corr_G = {det['corr_g1g2'] if det else 'н/д'}).")
+            print(f"   🔁 Переключаюсь на fallback-движок...")
+            from core.fallback_engine import try_process
+            out_dir = filepath.parent / f"{filepath.stem}_channels"
+            ok = try_process(filepath, out_dir=out_dir, save_rgb=True)
+            if not ok:
+                print(f"   ❌ Fallback тоже не сработал.")
+            return
+
         if det is None:
             print(f"   ❌ Не удалось определить параметры.")
             return
         print_detection(det)
+
+    # --- Собираем декодер из det
+    try:
+        decode_raw = make_decoder(det)
+    except Exception as e:
+        print(f"   ❌ Не удалось создать декодер: {e}")
+        return
 
     # --- Какие кадры
     if frame_mode == "first":
@@ -105,10 +136,7 @@ def process_file(filepath: Path, W: int, H: int,
         indices = list(range(len(packets)))
 
     out_dir = filepath.parent / f"{filepath.stem}_channels"
-    header   = det["header"]
-    unpack   = det["unpack"]
-    assembly = det["assembly"]
-    pattern  = det["pattern"]
+    pattern = det["pattern"]
 
     mode_label = {"all": f"все ({len(indices)})",
                   "first": "первый",
@@ -125,14 +153,13 @@ def process_file(filepath: Path, W: int, H: int,
                 f.seek(pkt["value_start"])
                 raw = f.read(pkt["length"])
 
-            frame = decode_frame(raw, header, unpack, assembly,
-                                 pattern, W_use, H_use)
+            frame = decode_raw(raw, W_use, H_use)
             chans = split_channels(frame, pattern)
 
             save_frame(chans, out_dir, idx, pattern, save_rgb=True)
             print(f"   ✅ кадр {idx:02d} → {print_channels_short(chans)}")
         except Exception as e:
-            print(f"   ❌ кадр {idx:02d}: {e}")
+            print(f"   ❌ кадр {idx:02d}: {type(e).__name__}: {e}")
 
     print(f"\n   ✅ Готово: {out_dir}")
 
@@ -183,6 +210,7 @@ def main_menu() -> None:
     verbose = False
     frame_mode = "all"
     frame_index = 0
+    engine = "auto"
 
     while True:
         files = find_raw_files(cwd)
@@ -196,6 +224,7 @@ def main_menu() -> None:
         print(f"  ARRIRAW → TIFF  (ALEXA Mini / LF)")
         print(f"  Папка:          {cwd}")
         print(f"  Разрешение:     {res_label}")
+        print(f"  Движок:         {engine}")
         print(f"  Режим расп.:    "
               f"{'ручной: ' + str(manual_params) if manual_params else 'авто'}")
         print(f"  Кадры:          {mode_label}")
@@ -214,6 +243,7 @@ def main_menu() -> None:
         if files:
             print(f"     [1..{len(files)}]  обработать один файл")
             print(f"     [a]          обработать все")
+        print(f"     [e]          движок: авто/mxf/fallback (сейчас: {engine})")
         print(f"     [f]          какие кадры (сейчас: {mode_label})")
         print(f"     [d]          сменить папку")
         print(f"     [r]          обновить список")
@@ -248,7 +278,7 @@ def main_menu() -> None:
                 print(f"   ❌ Не папка: {newdir}")
         elif choice == "p":
             print(f"\n  Разрешение кадра:")
-            print(f"     [1] авто (определить по размеру файла)")
+            print(f"     [1] авто")
             print(f"     [2] вручную")
             sub = input("  Выбор [1]: ").strip() or "1"
             if sub == "2":
@@ -271,6 +301,14 @@ def main_menu() -> None:
             else:
                 manual_params = None
                 print(f"   ✅ Режим: автоопределение")
+        elif choice == "e":
+            print(f"\n  Движок распаковки:")
+            print(f"     [1] auto — MXF, если не сработал → fallback")
+            print(f"     [2] mxf — только MXF-парсер")
+            print(f"     [3] fallback — только чтение как изображение")
+            sub = input("  Выбор [1]: ").strip() or "1"
+            engine = {"1": "auto", "2": "mxf", "3": "fallback"}.get(sub, "auto")
+            print(f"   ✅ Движок: {engine}")
         elif choice == "a" and files:
             for f in files:
                 try:
@@ -278,12 +316,13 @@ def main_menu() -> None:
                                  force_params=manual_params,
                                  verbose=verbose,
                                  frame_mode=frame_mode,
-                                 frame_index=frame_index)
+                                 frame_index=frame_index,
+                                 engine=engine)
                 except KeyboardInterrupt:
                     print("\n   ⏹ Прервано пользователем")
                     break
                 except Exception as e:
-                    print(f"   ❌ {f.name}: {e}")
+                    print(f"   ❌ {f.name}: {type(e).__name__}: {e}")
         else:
             try:
                 idx = int(choice) - 1
@@ -292,7 +331,8 @@ def main_menu() -> None:
                                  force_params=manual_params,
                                  verbose=verbose,
                                  frame_mode=frame_mode,
-                                 frame_index=frame_index)
+                                 frame_index=frame_index,
+                                 engine=engine)
                 else:
                     print("   ❌ Неверный номер")
             except ValueError:
@@ -300,21 +340,40 @@ def main_menu() -> None:
 
 
 def _prompt_manual_params() -> dict:
-    from core.decoder import UNPACK_FUNCS, ASSEMBLIES, PATTERNS as P
+    from core.decoder import (UNPACK_FUNCS, ASSEMBLIES, PATTERNS as P,
+                              SIDE_FORMULAS)
 
     print("\n  Ручные параметры распаковки:")
     header = _prompt_int("     header", 76)
-    print(f"     unpack:    {list(UNPACK_FUNCS)}")
-    unpack = _prompt("     unpack", "arri_alt")
-    if unpack not in UNPACK_FUNCS:
-        unpack = "arri_alt"
+
+    print(f"\n     Вариант A: каноническое имя")
+    print(f"       {list(UNPACK_FUNCS)}")
+    print(f"     Вариант B: пара индексов i1 / i2 из SIDE_FORMULAS "
+          f"(0..{len(SIDE_FORMULAS) - 1})")
+
+    use_pair = input("     Использовать пару (i1,i2)? [n]: ").strip().lower()
+    result = {"header": header}
+
+    if use_pair == "y":
+        result["i1"] = _prompt_int("     i1", 2)
+        result["i2"] = _prompt_int("     i2", 7)
+        result["unpack"] = f"pair({result['i1']},{result['i2']})"
+    else:
+        unpack = _prompt("     unpack", "arri_alt")
+        if unpack not in UNPACK_FUNCS:
+            unpack = "arri_alt"
+        result["unpack"] = unpack
+
     print(f"     assembly:  {list(ASSEMBLIES)}")
     assembly = _prompt("     assembly", "top_bottom")
     if assembly not in ASSEMBLIES:
         assembly = "top_bottom"
+    result["assembly"] = assembly
+
     print(f"     pattern:   {list(P)}")
     pattern = _prompt("     pattern", "GBRG")
     if pattern not in P:
         pattern = "GBRG"
-    return {"header": header, "unpack": unpack,
-            "assembly": assembly, "pattern": pattern}
+    result["pattern"] = pattern
+
+    return result

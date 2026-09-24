@@ -224,3 +224,100 @@ def detect_frame_size(essence_size: int,
         return None
     w, h, _, name = cands[0]
     return (w, h, name)
+
+# ===========================================================================
+# 24 side-формулы 12-бит: независимые формулы для p1 и p2.
+# Автоопределение перебирает пары (p1, p2).
+# ===========================================================================
+
+def _make_side_formulas():
+    names = ["b0", "b1", "b2"]
+    out = []
+    for xi, x in enumerate(names):
+        for yi, y in enumerate(names):
+            if xi == yi:
+                continue
+            out.append((
+                f"({x}<<4)|({y}>>4)",
+                lambda b0, b1, b2, X=xi, Y=yi:
+                    ((b0, b1, b2)[X] << 4) | ((b0, b1, b2)[Y] >> 4),
+            ))
+            out.append((
+                f"({x}<<4)|({y}&0x0F)",
+                lambda b0, b1, b2, X=xi, Y=yi:
+                    ((b0, b1, b2)[X] << 4) | ((b0, b1, b2)[Y] & 0x0F),
+            ))
+            out.append((
+                f"(({x}&0x0F)<<8)|{y}",
+                lambda b0, b1, b2, X=xi, Y=yi:
+                    (((b0, b1, b2)[X] & 0x0F) << 8) | (b0, b1, b2)[Y],
+            ))
+            out.append((
+                f"(({x}>>4)<<8)|{y}",
+                lambda b0, b1, b2, X=xi, Y=yi:
+                    (((b0, b1, b2)[X] >> 4) << 8) | (b0, b1, b2)[Y],
+            ))
+    return out
+
+
+SIDE_FORMULAS = _make_side_formulas()  # список (name, fn) — 24 штуки
+
+
+def unpack_pair(raw: bytes, i1: int, i2: int) -> np.ndarray:
+    """12-бит распаковка с независимыми формулами для p1 и p2."""
+    n = len(raw) // 3
+    d = np.frombuffer(raw[:n * 3], dtype=np.uint8)
+    b0 = d[0::3].astype(np.uint16)
+    b1 = d[1::3].astype(np.uint16)
+    b2 = d[2::3].astype(np.uint16)
+    p1 = SIDE_FORMULAS[i1][1](b0, b1, b2)
+    p2 = SIDE_FORMULAS[i2][1](b0, b1, b2)
+    out = np.empty(len(b0) * 2, dtype=np.uint16)
+    out[0::2] = p1
+    out[1::2] = p2
+    return out
+
+# ===========================================================================
+# Независимый декодер по ПАРЕ индексов (i1, i2) — для автоопределения
+# ===========================================================================
+
+def decode_frame_pair(raw: bytes, header: int, i1: int, i2: int,
+                      assembly: str, pattern: str,
+                      W: int, H: int) -> np.ndarray:
+    """
+    Декодирует кадр, используя явные формулы SIDE_FORMULAS[i1] и [i2].
+    Не зависит от UNPACK_FUNCS. Используется, когда autodetect нашёл
+    произвольную пару, не совпадающую с известной.
+    """
+    total = len(raw) - header
+    if total <= 0:
+        raise ValueError("header больше данных")
+    chunk_bytes = total // 2
+
+    c1 = unpack_pair(raw[header : header + chunk_bytes], i1, i2)
+    c2 = unpack_pair(raw[header + chunk_bytes : header + 2 * chunk_bytes],
+                     i1, i2)
+    return ASSEMBLIES[assembly](c1, c2, W, H)
+
+
+def make_decoder(det: dict):
+    """
+    Возвращает функцию decode(raw, W, H) -> np.ndarray.
+    Если в det есть i1/i2 — используется decode_frame_pair,
+    иначе — decode_frame с канонической функцией по имени.
+    """
+    if det.get("i1") is not None and det.get("i2") is not None:
+        i1 = det["i1"]; i2 = det["i2"]
+        header = det["header"]; assembly = det["assembly"]; pattern = det["pattern"]
+        def _decode(raw, W, H):
+            return decode_frame_pair(raw, header, i1, i2, assembly, pattern, W, H)
+        return _decode
+    # fallback на канонические функции
+    name = det["unpack"]
+    if name not in UNPACK_FUNCS:
+        raise ValueError(f"Неизвестная распаковка: {name}. "
+                         f"Доступны: {list(UNPACK_FUNCS)}")
+    header = det["header"]; assembly = det["assembly"]; pattern = det["pattern"]
+    def _decode(raw, W, H):
+        return decode_frame(raw, header, name, assembly, pattern, W, H)
+    return _decode

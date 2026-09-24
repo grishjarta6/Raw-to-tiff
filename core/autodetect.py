@@ -1,24 +1,42 @@
 """
 Автоопределение параметров распаковки ARRIRAW.
 
-Стратегия:
-  1. Проверяем known-good (header=76 + arri_alt + top_bottom) для всех
-     pattern. Если лучший corr(G1,G2) > 0.9 — сразу возвращаем.
-  2. Иначе полный перебор по viable header'ам.
+Метрика: corr(G1, G2). У правильного конфига > 0.9.
 
-Фильтр каналов — ОТНОСИТЕЛЬНЫЙ: min_std > MIN_STD_RATIO * max_std.
-Это позволяет обрабатывать сцены с преобладающим цветом
-(например, тёплые кадры, где синий канал имеет малый std).
+Возвращает словарь:
+    header, i1, i2, assembly, pattern,
+    unpack (человекочитаемая строка),
+    corr_g1g2, corr_br, sp_avg, min_std, max_std, stds, score
+
+Декодер сам решит, использовать decode_frame_pair или decode_frame,
+по наличию i1/i2.
 """
 
 import numpy as np
 
-from .decoder import UNPACK_FUNCS, ASSEMBLIES, PATTERNS, split_channels
+from .decoder import (ASSEMBLIES, PATTERNS, SIDE_FORMULAS,
+                      split_channels, unpack_pair)
 
 
-MIN_STD_ABS = 20.0       # абсолютный минимум (защита от полного нуля)
-MIN_STD_RATIO = 0.05     # min_std > 0.05 * max_std — все каналы «живые»
+MIN_STD_ABS = 20.0
+MIN_STD_RATIO = 0.05
 GOOD_CORR = 0.85
+WARN_CORR = 0.50
+
+
+def _find_idx(expr: str) -> int:
+    for i, (name, _) in enumerate(SIDE_FORMULAS):
+        if name == expr:
+            return i
+    raise KeyError(expr)
+
+
+KNOWN_PAIRS = {
+    "arri_alt":     (_find_idx("(b0<<4)|(b2>>4)"), _find_idx("((b2&0x0F)<<8)|b1")),
+    "std":          (_find_idx("(b0<<4)|(b1>>4)"), _find_idx("((b1&0x0F)<<8)|b2")),
+    "big_endian":   (_find_idx("(b0<<4)|(b2>>4)"), _find_idx("(b2<<4)|(b1&0x0F)")),
+    "little_endian":(_find_idx("((b1&0x0F)<<8)|b0"), _find_idx("((b1>>4)<<8)|b2")),
+}
 
 
 def _spatial_corr(img: np.ndarray) -> float:
@@ -30,14 +48,10 @@ def _spatial_corr(img: np.ndarray) -> float:
     return (hx + hy) / 2
 
 
-def _score_channels(chans: dict) -> dict | None:
-    stds = {name: float(img.std()) for name, img in chans.items()}
-    min_std = min(stds.values())
-    max_std = max(stds.values())
-
-    if min_std < MIN_STD_ABS:
-        return None
-    if max_std < 1.0 or min_std / max_std < MIN_STD_RATIO:
+def _score(chans: dict) -> dict | None:
+    stds = {k: float(v.std()) for k, v in chans.items()}
+    mn, mx = min(stds.values()), max(stds.values())
+    if mn < MIN_STD_ABS or mx < 1.0 or mn / mx < MIN_STD_RATIO:
         return None
 
     g1 = chans["G1"].flatten().astype(np.float32)
@@ -51,176 +65,162 @@ def _score_channels(chans: dict) -> dict | None:
           _spatial_corr(chans["G2"]) + _spatial_corr(chans["R"])) / 4
 
     return {
-        "score":     corr_g * 1000.0 + sp * 10.0 + min_std / 100.0,
         "corr_g1g2": corr_g,
         "corr_br":   corr_br,
         "sp_avg":    sp,
         "stds":      stds,
-        "min_std":   min_std,
-        "max_std":   max_std,
-        "mean_R":    float(r.mean()),
-        "mean_B":    float(b.mean()),
+        "min_std":   mn,
+        "max_std":   mx,
+        "score":     corr_g * 1000.0 + sp * 10.0 + mn / 100.0,
     }
 
 
-def _viable_headers(essence_size: int, W: int, H: int,
-                    max_header: int = 512) -> list[int]:
-    """
-    Все header'ы в [0, max_header), при которых
-
-        (essence_size - header) == 2 * ((W*H/2) * 3/2)
-
-    Для 3424×2202 / essence 11 309 548 → [76]
-    Для 3424×2202 / essence 11 309 472 → [0]
-    Для 4448×3096 / essence 20 656 552 → [40]
-    """
-    chunk_pixels = (W * H) // 2
-    chunk_bytes = chunk_pixels * 3 // 2
-    needed = 2 * chunk_bytes
-    return [h for h in range(0, max_header) if essence_size - h == needed]
+def _viable_headers(essence_size, W, H, max_header=512):
+    chunk = (W * H // 2) * 3 // 2
+    needed = 2 * chunk
+    return [h for h in range(max_header) if essence_size - h == needed]
 
 
-def _evaluate_one(raw, essence_size, hdr, unpack_mode, assembly,
-                  W, H, sample_H, debug: bool = False) -> list[dict]:
-    remaining = essence_size - hdr
+def _eval_pair(raw, hdr, i1, i2, assembly, W, H, sample_H):
+    """Возвращает лучший pattern-кандидат или None."""
+    remaining = len(raw) - hdr
     if remaining <= 0:
-        return []
+        return None
     chunk_bytes = remaining // 2
-
     try:
-        c1 = UNPACK_FUNCS[unpack_mode](raw[hdr : hdr + chunk_bytes])
-        c2 = UNPACK_FUNCS[unpack_mode](
-            raw[hdr + chunk_bytes : hdr + 2 * chunk_bytes])
-    except Exception as e:
-        if debug:
-            print(f"      ⚠ unpack {unpack_mode}: {e}")
-        return []
-
-    try:
+        c1 = unpack_pair(raw[hdr : hdr + chunk_bytes], i1, i2)
+        c2 = unpack_pair(raw[hdr + chunk_bytes : hdr + 2 * chunk_bytes], i1, i2)
         frame = ASSEMBLIES[assembly](c1, c2, W, H)
-    except Exception as e:
-        if debug:
-            print(f"      ⚠ assembly {assembly}: {e}")
-        return []
+    except Exception:
+        return None
 
     sample = frame[:sample_H, :]
-    out = []
+    best = None
     for pattern in PATTERNS:
         chans = split_channels(sample, pattern)
-        sc = _score_channels(chans)
+        sc = _score(chans)
         if sc is None:
-            if debug:
-                stds = {k: float(v.std()) for k, v in chans.items()}
-                print(f"      ⚠ {unpack_mode}/{assembly}/{pattern}: "
-                      f"stds={ {k: round(v,1) for k,v in stds.items()} }")
             continue
-        out.append({
+        cand = {
             "header":   hdr,
-            "unpack":   unpack_mode,
+            "i1":       i1,
+            "i2":       i2,
             "assembly": assembly,
             "pattern":  pattern,
             **sc,
-        })
-    return out
+        }
+        if best is None or cand["score"] > best["score"]:
+            best = cand
+    return best
 
 
-def autodetect(filepath, pkt, W: int, H: int,
-               sample_rows: int = 500,
-               verbose: bool = False) -> dict | None:
+def _label(i1: int, i2: int) -> str:
+    return f"{SIDE_FORMULAS[i1][0]} + {SIDE_FORMULAS[i2][0]}"
+
+
+def _finalize(c: dict) -> dict:
+    """Дописывает человекочитаемый unpack. Не трогает i1/i2."""
+    i1, i2 = c.get("i1"), c.get("i2")
+    if i1 is None or i2 is None:
+        # не pair-декодер, оставляем как есть
+        return c
+    canon = None
+    for name, (a, b) in KNOWN_PAIRS.items():
+        if (i1, i2) == (a, b):
+            canon = name
+            break
+    c["unpack"] = canon or _label(i1, i2)
+    return c
+
+
+def autodetect(filepath, pkt, W, H, sample_rows=300, verbose=False):
     essence_size = pkt["length"]
     sample_H = min(sample_rows, H)
-
-    print(f"\n   🔧 Доступные unpack: {list(UNPACK_FUNCS)}")
 
     viable = _viable_headers(essence_size, W, H)
     print(f"   🔍 Жизнеспособные header для {W}×{H}: {viable}")
     if not viable:
-        print(f"   ⚠ Ни один header в [0, 512) не подходит для {W}×{H}.")
+        print(f"   ⚠ Ни один header в [0, 512) не подходит.")
         print(f"   ⚠ essence_size={essence_size:,}")
-        print(f"   ⚠ Задайте разрешение вручную ([p] в меню).")
         return None
 
     with open(filepath, "rb") as f:
         f.seek(pkt["value_start"])
         raw = f.read(essence_size)
 
-    # ===============================================================
-    # ШАГ 1. Known-good
-    # ===============================================================
-    print(f"\n   🔍 Шаг 1: arri_alt + top_bottom (known-good)...")
+    # ---- Шаг 1: известные пары на top_bottom
+    print(f"\n   🔍 Шаг 1: известные пары формул (top_bottom)...")
 
-    known_good: list[dict] = []
-    for hdr in viable:
-        cands = _evaluate_one(raw, essence_size, hdr,
-                              "arri_alt", "top_bottom",
-                              W, H, sample_H, debug=True)
-        known_good.extend(cands)
+    best_known = None
+    for name, (i1, i2) in KNOWN_PAIRS.items():
+        for hdr in viable:
+            cand = _eval_pair(raw, hdr, i1, i2, "top_bottom",
+                              W, H, sample_H)
+            if cand is None:
+                continue
+            if best_known is None or cand["score"] > best_known["score"]:
+                best_known = cand
+                print(f"      ✅ {name:<14} hdr={hdr} "
+                      f"pattern={cand['pattern']:<4} "
+                      f"corr_G={cand['corr_g1g2']:+.4f}")
 
-    if known_good:
-        known_good.sort(key=lambda c: c["corr_g1g2"], reverse=True)
-        print(f"   ✅ Получено {len(known_good)} кандидатов:")
-        for c in known_good:
-            print(f"      pattern={c['pattern']:<6}  "
-                  f"corr_G={c['corr_g1g2']:+.4f}  "
-                  f"corr_BR={c['corr_br']:+.4f}  "
-                  f"sp={c['sp_avg']:+.4f}  "
-                  f"min_std={c['min_std']:.0f}")
+    if best_known and best_known["corr_g1g2"] > GOOD_CORR:
+        print(f"   ✅ corr_G > {GOOD_CORR} — используем "
+              f"{_finalize(best_known)['unpack']}")
+        return _finalize(best_known)
 
-        best = known_good[0]
-        if best["corr_g1g2"] > GOOD_CORR:
-            print(f"   ✅ corr_G = {best['corr_g1g2']:+.4f} > "
-                  f"{GOOD_CORR} — используем {best['pattern']}")
-            return best
-        print(f"   ⚠ corr_G = {best['corr_g1g2']:+.4f} < {GOOD_CORR}, "
-              f"продолжаю поиск")
-    else:
-        print(f"   ⚠ known-good не дал кандидатов")
+    # ---- Шаг 2: полный перебор пар (i1, i2) × assembly
+    print(f"\n   🔍 Шаг 2: полный перебор 24×23 пар формул...")
 
-    # ===============================================================
-    # ШАГ 2. Полный перебор
-    # ===============================================================
-    print(f"\n   🔍 Шаг 2: полный перебор...")
+    candidates = []
+    n_pairs = 0
+    for i1 in range(len(SIDE_FORMULAS)):
+        for i2 in range(len(SIDE_FORMULAS)):
+            if i1 == i2:
+                continue
+            n_pairs += 1
+            for hdr in viable:
+                for asm in ASSEMBLIES:
+                    cand = _eval_pair(raw, hdr, i1, i2, asm,
+                                      W, H, sample_H)
+                    if cand is None:
+                        continue
+                    candidates.append(cand)
 
-    candidates: list[dict] = []
-    for hdr in viable:
-        for unpack_mode in UNPACK_FUNCS:
-            for assembly in ASSEMBLIES:
-                candidates.extend(
-                    _evaluate_one(raw, essence_size, hdr, unpack_mode,
-                                  assembly, W, H, sample_H))
+    print(f"      Проверено пар: {n_pairs} × "
+          f"{len(viable)} hdr × {len(ASSEMBLIES)} asm = "
+          f"{n_pairs * len(viable) * len(ASSEMBLIES)}")
 
     if not candidates:
-        if known_good:
-            return known_good[0]
+        if best_known:
+            return _finalize(best_known)
         return None
 
     candidates.sort(key=lambda x: x["score"], reverse=True)
 
-    print(f"\n   🏆 Топ-5 кандидатов:")
-    print(f"      {'#':>3}  {'hdr':>4}  {'unpack':<15} "
-          f"{'assembly':<18} {'pattern':<6}  "
-          f"{'corr_G':>8}  {'corr_BR':>8}  {'sp':>7}  "
-          f"{'min_std':>8}  {'max_std':>8}")
-    print("      " + "-" * 110)
-    for i, c in enumerate(candidates[:5], 1):
+    print(f"\n   🏆 Топ-10 кандидатов:")
+    print(f"      {'#':>3}  {'corr_G':>8}  {'corr_BR':>8}  "
+          f"{'sp':>7}  {'min_std':>8}  {'hdr':>4}  "
+          f"{'assembly':<18}  {'pattern':<6}  formulas")
+    print("      " + "-" * 116)
+    for i, c in enumerate(candidates[:10], 1):
         marker = " ★" if i == 1 else "  "
-        print(f"      {i:>3}  {c['header']:>4}  {c['unpack']:<15} "
-              f"{c['assembly']:<18} {c['pattern']:<6}  "
-              f"{c['corr_g1g2']:>+8.4f}  {c['corr_br']:>+8.4f}  "
+        print(f"      {i:>3}  {c['corr_g1g2']:>+8.4f}  {c['corr_br']:>+8.4f}  "
               f"{c['sp_avg']:>+7.3f}  {c['min_std']:>8.0f}  "
-              f"{c['max_std']:>8.0f}{marker}")
+              f"{c['header']:>4}  {c['assembly']:<18}  "
+              f"{c['pattern']:<6}  {_label(c['i1'], c['i2'])}{marker}")
 
-        best = candidates[0]
-    if best["corr_g1g2"] < 0.5:
-        print(f"\n   ⚠ Даже лучший кандидат corr(G1,G2) = "
-              f"{best['corr_g1g2']:+.3f} < 0.5")
-        print(f"   ⚠ Параметры распаковки подобраны неуверенно.")
-        print(f"   ⚠ Возможные причины:")
-        print(f"      - файл в формате HDE (сжат) — нужен ARRI SDK")
-        print(f"      - пустой / тестовый кадр")
-        print(f"      - разрешение определено неверно (попробуйте [p])")
-        if known_good:
-            print(f"   ℹ Возвращаю known-good (может быть пустой кадр).")
-            return known_good[0]
-        print(f"   ℹ Возвращаю лучший найденный (возможен мусор).")
-    return best
+    best = candidates[0]
+    if best["corr_g1g2"] < WARN_CORR:
+        print(f"\n   ⚠ corr_G = {best['corr_g1g2']:+.3f} < {WARN_CORR}")
+        print(f"   ⚠ Уверенности нет:")
+        print(f"      - файл HDE/сжат → нужен ARRI SDK")
+        print(f"      - повреждён / тестовый")
+        print(f"      - нестандартный формат")
+        if best_known:
+            print(f"   ℹ Откат на известную пару: "
+                  f"{_finalize(best_known)['unpack']}")
+            return _finalize(best_known)
+        return _finalize(best)
+
+    return _finalize(best)
